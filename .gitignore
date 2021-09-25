@@ -1,0 +1,8 @@
+*.o
+*.tar.gz
+*.ko
+*.mod
+*.symvers
+*.order
+*.png
+

@@ -1,0 +1,104 @@
+diff --git a/Makefile b/Makefile
+index 0565caea0362..88775083b264 100644
+--- a/Makefile
++++ b/Makefile
+@@ -2,7 +2,7 @@
+ VERSION = 5
+ PATCHLEVEL = 13
+ SUBLEVEL = 0
+-EXTRAVERSION =
++EXTRAVERSION = test2
+ NAME = Opossums on Parade
+ 
+ # *DOCUMENTATION*
+diff --git a/arch/x86/entry/syscalls/syscall_64.tbl b/arch/x86/entry/syscalls/syscall_64.tbl
+index ce18119ea0d0..c82b6f921ff4 100644
+--- a/arch/x86/entry/syscalls/syscall_64.tbl
++++ b/arch/x86/entry/syscalls/syscall_64.tbl
+@@ -368,7 +368,7 @@
+ 444	common	landlock_create_ruleset	sys_landlock_create_ruleset
+ 445	common	landlock_add_rule	sys_landlock_add_rule
+ 446	common	landlock_restrict_self	sys_landlock_restrict_self
+-
++447	common	encrypt			sys_s2_encrypt
+ #
+ # Due to a historical design error, certain syscalls are numbered differently
+ # in x32 as compared to native x86_64.  These syscalls have numbers 512-547.
+diff --git a/include/linux/syscalls.h b/include/linux/syscalls.h
+index 050511e8f1f8..ccee36307c4f 100644
+--- a/include/linux/syscalls.h
++++ b/include/linux/syscalls.h
+@@ -1377,4 +1377,6 @@ int __sys_getsockopt(int fd, int level, int optname, char __user *optval,
+ 		int __user *optlen);
+ int __sys_setsockopt(int fd, int level, int optname, char __user *optval,
+ 		int optlen);
++
++asmlinkage long sys_s2_encrypt(char* msg, int key);
+ #endif
+diff --git a/kernel/Makefile b/kernel/Makefile
+index 4df609be42d0..90f46e369daf 100644
+--- a/kernel/Makefile
++++ b/kernel/Makefile
+@@ -10,7 +10,7 @@ obj-y     = fork.o exec_domain.o panic.o \
+ 	    extable.o params.o \
+ 	    kthread.o sys_ni.o nsproxy.o \
+ 	    notifier.o ksysfs.o cred.o reboot.o \
+-	    async.o range.o smpboot.o ucount.o regset.o
++	    async.o range.o smpboot.o ucount.o regset.o encrypt.o
+ 
+ obj-$(CONFIG_USERMODE_DRIVER) += usermode_driver.o
+ obj-$(CONFIG_MODULES) += kmod.o
+diff --git a/kernel/encrypt.c b/kernel/encrypt.c
+new file mode 100644
+index 000000000000..fe60b5afae9d
+--- /dev/null
++++ b/kernel/encrypt.c
+@@ -0,0 +1,28 @@
++#include <linux/kernel.h>
++#include <linux/errno.h>
++#include <linux/syscalls.h>
++
++SYSCALL_DEFINE2(s2_encrypt, char*, msg, int, key)
++{
++	char buff[100];
++	int i=0;
++	while(msg[i]!='\0')
++	{
++		buff[i] = msg[i];
++		++i;
++	}
++	buff[i]='\0';
++
++	i=0;
++	if(key<1 || key>5)
++		return EINVAL;
++	while(buff[i] != '\0')
++	{
++		char ch = buff[i];
++		ch = ch + key;
++		buff[i] = ch;
++		++i;
++	}
++	printk(KERN_INFO "encrypted output is: %s\n", buff);
++	return 0;
++}
+diff --git a/net/socket.c b/net/socket.c
+index 4f2c6d2795d0..9d798b86760d 100644
+--- a/net/socket.c
++++ b/net/socket.c
+@@ -1768,6 +1768,7 @@ int __sys_accept4(int fd, struct sockaddr __user *upeer_sockaddr,
+ {
+ 	int ret = -EBADF;
+ 	struct fd f;
++	printk(KERN_INFO "Hello from accept()!");
+ 
+ 	f = fdget(fd);
+ 	if (f.file) {
+@@ -1831,6 +1832,7 @@ int __sys_connect(int fd, struct sockaddr __user *uservaddr, int addrlen)
+ {
+ 	int ret = -EBADF;
+ 	struct fd f;
++	printk(KERN_INFO "Hello from connect()!");
+ 
+ 	f = fdget(fd);
+ 	if (f.file) {

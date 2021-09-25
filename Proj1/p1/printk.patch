@@ -1,0 +1,20 @@
+diff --git a/net/socket.c b/net/socket.c
+index 4f2c6d2795d0..9d798b86760d 100644
+--- a/net/socket.c
++++ b/net/socket.c
+@@ -1768,6 +1768,7 @@ int __sys_accept4(int fd, struct sockaddr __user *upeer_sockaddr,
+ {
+ 	int ret = -EBADF;
+ 	struct fd f;
++	printk(KERN_INFO "Hello from accept()!");
+ 
+ 	f = fdget(fd);
+ 	if (f.file) {
+@@ -1831,6 +1832,7 @@ int __sys_connect(int fd, struct sockaddr __user *uservaddr, int addrlen)
+ {
+ 	int ret = -EBADF;
+ 	struct fd f;
++	printk(KERN_INFO "Hello from connect()!");
+ 
+ 	f = fdget(fd);
+ 	if (f.file) {
