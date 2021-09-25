@@ -18,7 +18,7 @@ MODULE_DESCRIPTION("LKP Project 3");
 static int counter = 0;
 
 /*
- * define kprobe information like, the symbol name
+ * set up kprobe information 
  */
 #define MAX_SYMBOL_LEN 64
 static char symbol[MAX_SYMBOL_LEN] = "perftop_show";
@@ -51,18 +51,23 @@ struct ht_entry {
 static int ht_store(int key)
 {
 	struct ht_entry *curr;
-	int val = 1;
+	int val = 0;
 	struct ht_entry *my_entry = kmalloc(sizeof(*my_entry), GFP_KERNEL);
 	if(!my_entry || my_entry == NULL)
                 return -ENOMEM;
 	
+	/*
+	 * check for key, if it exists remove the entry and create new entry with incremented value
+	 * cannot find any other way to do this
+	 *
+	 */
 	hash_for_each_possible(tbl, curr, hashlist, key) {
 		val = curr->data;
 		hash_del(&curr->hashlist);
 		kfree(curr);
 	}
 	
-	my_entry->data = val;
+	my_entry->data = val + 1;
 	hash_add(tbl, &my_entry->hashlist, key);
 	return 0;
 }
@@ -86,28 +91,48 @@ static void destroy_ht(void)
  */
 static int __kprobes handler_pre(struct kprobe *p, struct pt_regs *regs)
 {
-//	int rc = 0;
-	//struct thread_info* ti = regs->r11;
-	//struct task_struct *task = regs->sp - 8;
-	int pid = task->pid;
+	int rc = 0;
+
+	/* how do we get task_struct from regs? */
+	//struct thread_info* ti = regs->r11; //nope	
+	//struct task_struct *task = ti->task; //nope (outdated)
+	//int pid = task->pid;
+
+	/* increment the counter variable */
 	++counter;
-	printk(KERN_INFO "<%s> p->addr = 0x%p, sp = 0x%lx, pid=%d\n", p->symbol_name, p->addr, (regs->sp & ~(THREAD_SIZE - 1)), pid);
-	//printk(KERN_INFO "counter value = %d\n", counter);
 
-//	printk("My current pid: %d\n", current->pid);
-//	rc = ht_store(current->pid);
-//	if(rc)
-//		printk("error storing pid: %d\n", current->pid);
+	/* prints something irrelevant for now */
+	//printk(KERN_INFO "<%s> p->addr = 0x%p, sp = 0x%lx", p->symbol_name, p->addr, (regs->sp & ~(THREAD_SIZE - 1)));
 
-	return 0;
+
+	/* this print works - but might hang because of lot of prints in dmesg */
+	//printk("My current pid: %d\n", current->pid);
+	
+
+
+	/* store pid count in hash table 
+	 * - definitely hangs on uncommenting this code
+	 */
+
+	/*
+	rc = ht_store(current->pid);
+	if(rc)
+		printk("error storing pid: %d\n", current->pid);
+	*/
+
+	return rc;
 }
 
 static void __kprobes handler_post(struct kprobe *p, struct pt_regs *regs, unsigned long flags) 
 {
-//	struct ht_entry *curr_entry;
-  //      int key = current->pid;
-    //    hash_for_each_possible(tbl, curr_entry, hashlist, key)
-      //          printk(KERN_CONT "key: %d and val: %d ", key, curr_entry->data);
+	/* print hash table entries */
+
+	/*
+	struct ht_entry *curr_entry;
+        int key = current->pid;
+        hash_for_each_possible(tbl, curr_entry, hashlist, key)
+		printk(KERN_CONT "key: %d and val: %d ", key, curr_entry->data);
+	*/
 }
 
 /*
@@ -171,18 +196,27 @@ static int __init perftop_init(void)
 	return 0;
 }
 
-static void __exit perftop_exit(void)
+static void cleanup(void)
 {
+	/* unregistering the kprobes */
 	unregister_kprobe(&kp);
-	printk(KERN_INFO "first kprobe at %p unregistered\n", kp.addr);
+        printk(KERN_INFO "first kprobe at %p unregistered\n", kp.addr);
 
-	unregister_kprobe(&kp2);
+        unregister_kprobe(&kp2);
         printk(KERN_INFO "second kprobe at %p unregistered\n", kp2.addr);
 
-//	destroy_ht();
+	/* cleaning hash table */
+//      destroy_ht();
 
-	remove_proc_entry("perftop", NULL);
-	printk(KERN_INFO "/proc/perftop removed!\n");
+	/* removing proc node */
+        remove_proc_entry("perftop", NULL);
+        printk(KERN_INFO "/proc/perftop removed!\n");
+	return;
+}
+
+static void __exit perftop_exit(void)
+{
+	cleanup();
 	return;
 }
 
