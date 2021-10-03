@@ -8,6 +8,7 @@
 #include <linux/hashtable.h>
 #include <linux/sched.h>
 
+
 /* Module information */
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("Monami Dutta Gupta");
@@ -21,7 +22,7 @@ static int counter = 0;
  * set up kprobe information 
  */
 #define MAX_SYMBOL_LEN 64
-static char symbol[MAX_SYMBOL_LEN] = "perftop_show";
+static char symbol[MAX_SYMBOL_LEN] = "perftop_open";
 module_param_string(symbol, symbol, sizeof(symbol), 0644);
 
 static char symbol2[MAX_SYMBOL_LEN] = "pick_next_task_fair";
@@ -31,9 +32,6 @@ static struct kprobe kp = {
 	.symbol_name = symbol
 };
 
-static struct kprobe kp2 = {
-	.symbol_name = symbol2
-};
 
 /*
  * Hash Table Implementation
@@ -43,6 +41,7 @@ static struct kprobe kp2 = {
 static DEFINE_HASHTABLE(tbl, BITS);
 
 struct ht_entry {
+	int pid;
         int data;
         struct hlist_node hashlist;
 };
@@ -52,7 +51,7 @@ static int ht_store(int key)
 {
 	struct ht_entry *curr;
 	int val = 0;
-	struct ht_entry *my_entry = kmalloc(sizeof(*my_entry), GFP_KERNEL);
+	struct ht_entry *my_entry = kmalloc(sizeof(*my_entry), GFP_ATOMIC);
 	if(!my_entry || my_entry == NULL)
                 return -ENOMEM;
 	
@@ -68,6 +67,7 @@ static int ht_store(int key)
 	}
 	
 	my_entry->data = val + 1;
+	my_entry->pid = key;
 	hash_add(tbl, &my_entry->hashlist, key);
 	return 0;
 }
@@ -87,53 +87,40 @@ static void destroy_ht(void)
 
 
 /* 
- * kprobes pre and post handler implementation
+ * kprobes pre handler implementation
+ * kretprobe return handler implementation
  */
+
+
 static int __kprobes handler_pre(struct kprobe *p, struct pt_regs *regs)
 {
+	++counter;
+	return 0;
+}
+
+static int ret_handler(struct kretprobe_instance *ri, struct pt_regs *regs) 
+{
+	
 	int rc = 0;
 
-	/* how do we get task_struct from regs? */
-	//struct thread_info* ti = regs->r11; //nope	
-	//struct task_struct *task = ti->task; //nope (outdated)
-	//int pid = task->pid;
+	unsigned long retval = regs_return_value(regs);
 
-	/* increment the counter variable */
-	++counter;
+	if(retval) {
+        	struct task_struct *task = (struct task_struct *)(retval);
+        	int pid = task->pid;
 
-	/* prints something irrelevant for now */
-	//printk(KERN_INFO "<%s> p->addr = 0x%p, sp = 0x%lx", p->symbol_name, p->addr, (regs->sp & ~(THREAD_SIZE - 1)));
-
-
-	/* this print works - but might hang because of lot of prints in dmesg */
-	//printk("My current pid: %d\n", current->pid);
-	
-
-
-	/* store pid count in hash table 
-	 * - definitely hangs on uncommenting this code
-	 */
-
-	/*
-	rc = ht_store(current->pid);
-	if(rc)
-		printk("error storing pid: %d\n", current->pid);
-	*/
+		rc = ht_store(pid);
+        	if(rc)
+			printk("error storing pid: %d\n", pid);
+	}
 
 	return rc;
 }
 
-static void __kprobes handler_post(struct kprobe *p, struct pt_regs *regs, unsigned long flags) 
-{
-	/* print hash table entries */
-
-	/*
-	struct ht_entry *curr_entry;
-        int key = current->pid;
-        hash_for_each_possible(tbl, curr_entry, hashlist, key)
-		printk(KERN_CONT "key: %d and val: %d ", key, curr_entry->data);
-	*/
-}
+static struct kretprobe my_kretprobe = {
+	.handler = ret_handler,
+	.kp.symbol_name = symbol2
+};
 
 /*
  * proc node implementation
@@ -150,9 +137,17 @@ static const struct proc_ops perftop_ops = {
 };
 
 static int perftop_show(struct seq_file *m, void *v)
-{
+{	
+	int bkt;
+	struct ht_entry *curr_entry;
+
 	seq_printf(m, "Hello World!\n");
 	seq_printf(m, "Counter value = %d\n", counter);
+
+	/* print hash table entries */
+        hash_for_each(tbl, bkt, curr_entry, hashlist)
+                seq_printf(m, "key: %d and val: %d\n", curr_entry->pid, curr_entry->data);
+	
 	return 0;
 }
 
@@ -169,10 +164,7 @@ static int __init perftop_init(void)
 {
 	int ret;
 	kp.pre_handler = handler_pre;
-	kp.post_handler = handler_post;
-	kp2.pre_handler = handler_pre;
-	kp2.post_handler = handler_post;
-
+	
 	/* create proc node */
 	proc_create("perftop", 0, NULL, &perftop_ops);
 	printk(KERN_INFO "/proc/perftop created!\n");
@@ -185,14 +177,16 @@ static int __init perftop_init(void)
 	}
 	printk(KERN_INFO "planted first kprobe at %p\n", kp.addr);
 	
+
+
 	/* register second kprobe */
-	ret = register_kprobe(&kp2);
+	ret = register_kretprobe(&my_kretprobe);
         if(ret < 0) {
                 printk(KERN_INFO "register kprobe failed, returned %d\n", ret);
                 return ret;
         }
-        printk(KERN_INFO "planted second kprobe at %p\n", kp2.addr);
-	
+        printk(KERN_INFO "planted second kprobe at %p\n", my_kretprobe.kp.addr);
+
 	return 0;
 }
 
@@ -202,11 +196,11 @@ static void cleanup(void)
 	unregister_kprobe(&kp);
         printk(KERN_INFO "first kprobe at %p unregistered\n", kp.addr);
 
-        unregister_kprobe(&kp2);
-        printk(KERN_INFO "second kprobe at %p unregistered\n", kp2.addr);
+        unregister_kretprobe(&my_kretprobe);
+        printk(KERN_INFO "second kprobe at %p unregistered\n", my_kretprobe.kp.addr);
 
 	/* cleaning hash table */
-//      destroy_ht();
+        destroy_ht();
 
 	/* removing proc node */
         remove_proc_entry("perftop", NULL);

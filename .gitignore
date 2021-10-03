@@ -5,4 +5,7 @@
 *.symvers
 *.order
 *.png
-
+*.cmd
+**faddr2line
+*.mod.c
+*.c~

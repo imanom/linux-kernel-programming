@@ -1,1 +1,2 @@
+bash faddr2line ../../linux/vmlinux kprobe_ftrace_handler+0x10e/0x1d0
 sudo cat /proc/kallsyms | grep perftop
