@@ -14,6 +14,10 @@
 #include <linux/kallsyms.h>
 #include <linux/spinlock.h>
 
+#define BUFF_SIZE 1024
+#define STACK_ENTRIES 4
+
+
 /* Module information */
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("Monami Dutta Gupta");
@@ -23,8 +27,6 @@ typedef unsigned long (*kallsyms_lookup_name_t)(const char *name);
 typedef unsigned int (*stack_trace_save_user_t)(unsigned long *store, unsigned int size);
 
 static kallsyms_lookup_name_t addr=NULL;
-static DEFINE_RAW_SPINLOCK(hash_lock);
-static DEFINE_RAW_SPINLOCK(rb_lock);
 static DEFINE_RAW_SPINLOCK(main_lock);
 
 
@@ -78,9 +80,11 @@ static kallsyms_lookup_name_t get_kallsyms_ptr(void)
  *
  */
 
+static DEFINE_RAW_SPINLOCK(rb_lock);
+
 struct rb_struct {
 	unsigned long long time;
-	unsigned long buff[1024];
+	unsigned long buff[BUFF_SIZE];
 	struct rb_node node;
 };
 
@@ -103,6 +107,7 @@ static void del_node(struct rb_node* curr)
 	my_entry = rb_entry(curr, struct rb_struct, node);
 	rb_erase(&my_entry->node, &rbtree);
 	kfree(my_entry);
+	printk(KERN_INFO "Deleted!\n");
 
 }
 
@@ -124,6 +129,7 @@ static void find_node(unsigned long long prev_task_time)
                 else if(c>0)
                         link = &parent->rb_right;
                 else {
+			printk(KERN_INFO "Found and handled!\n");
                         del_node(parent);
                         break;
                 }
@@ -133,18 +139,25 @@ static void find_node(unsigned long long prev_task_time)
 static int store_rb(unsigned long long time, unsigned long* buff, int len, unsigned long long prev_task_time)
 {
 	unsigned long flags;
-	int itr = 0;
-	struct rb_node **link = &rbtree.rb_node;
-	struct rb_node *parent = NULL;
+	int itr;
+	struct rb_node **link;
+	struct rb_node *parent;
 	struct rb_struct *curr;
-	struct rb_struct *my_entry = kmalloc(sizeof(my_entry), GFP_ATOMIC);
-	if(!my_entry || my_entry == NULL)
-		return -ENOMEM;
+	struct rb_struct *my_entry;
 
-//	find_node(prev_task_time);
+	printk(KERN_INFO "\n\n\n Hi!\n");
+
+	find_node(prev_task_time);
 
 	raw_spin_lock_irqsave(&rb_lock, flags);
-
+	link = &rbtree.rb_node;
+	parent = NULL;
+	my_entry = kmalloc(sizeof(my_entry), GFP_ATOMIC);
+        if(!my_entry || my_entry == NULL){
+		raw_spin_unlock_irqrestore(&rb_lock, flags);
+                return -ENOMEM;
+	}
+	
 	my_entry->time = time;
 	for(itr=0; itr<len; itr++)
                 my_entry->buff[itr] = buff[itr];
@@ -159,9 +172,12 @@ static int store_rb(unsigned long long time, unsigned long* buff, int len, unsig
 			link = &parent->rb_right;
 	}
 
-
+	printk(KERN_INFO "buffer data: 0x%lu\n", my_entry->buff[0]);
 	rb_link_node(&my_entry->node, parent, link);
+
+	printk(KERN_INFO "Inserted?\n");
 	rb_insert_color(&my_entry->node, &rbtree);
+	printk(KERN_INFO "Colored? \n");
 
 	raw_spin_unlock_irqrestore(&rb_lock, flags);
 
@@ -190,13 +206,17 @@ static void destroy_rb(void)
  */
 
 #define BITS 10
+
+static DEFINE_RAW_SPINLOCK(hash_lock);
+
 static DEFINE_HASHTABLE(tbl, BITS);
 
 struct ht_entry {
 	raw_spinlock_t lock;
         int data;
 	int pid;
-	unsigned long buff[1024];
+	unsigned long buff[BUFF_SIZE];
+	char function_name[BUFF_SIZE];
 	unsigned long long curr_task_time;
 	unsigned long long prev_task_time;
         struct hlist_node hashlist;
@@ -232,8 +252,12 @@ static unsigned long long ht_store(u32 key,int pid, unsigned long* buff,int len,
 		kfree(curr);
 	}
 
-	for(itr=0; itr<len; itr++)
+	for(itr=0; itr<len; itr++){
 		my_entry->buff[itr] = buff[itr];
+
+		//store function name of address
+		sprint_symbol(&my_entry->function_name[itr], buff[itr]); 
+	}
 
 	my_entry->data = val + 1;
 	my_entry->pid = pid;
@@ -265,58 +289,13 @@ static void destroy_ht(void)
 }
 
 
-/*
- * Hash table to act as cache to store entry time and pid
- *
- */
-
-static DEFINE_HASHTABLE(cache_tbl, BITS);
-static DEFINE_RAW_SPINLOCK(cache_lock);
-
-struct cache_entry {
-	raw_spinlock_t lock;
-	int pid;
-	unsigned long long entry_time;
-	struct hlist_node hashlist;
-};
-
-static int cache_store(int key, unsigned long long time)
-{
-	struct cache_entry *curr;
-	unsigned long flags;
-	int val = 0;
-	struct cache_entry *my_entry = kmalloc(sizeof(*my_entry), GFP_ATOMIC);
-	if(!my_entry || my_entry ==NULL)
-		return -ENOMEM;
-
-	raw_spin_lock_init(&my_entry->lock);
-	raw_spin_lock_irqsave(&cache_lock, flags);
-	
-	my_entry->pid = key;
-	my_entry->entry_time = time;
-	hash_add(cache_tbl, &my_entry->hashlist, key);
-	
-	raw_spin_unlock_irqrestore(&cache_lock, flags);
-
-	return 0;
-}
-
-static void cache_destroy(void)
-{
-	struct cache_entry *curr_entry;
-	int bkt;
- 	struct hlist_node *next;
-	printk(KERN_INFO "Deleting cache table!");
-	hash_for_each_safe(cache_tbl, bkt, next, curr_entry, hashlist){
-		hash_del(&curr_entry->hashlist);
-		kfree(curr_entry);
-	}
-
-}
-
 /* 
  * 
- * kretprobe return handler implementation
+ * handle_stack() implementation
+ * main function which which finds the stack trace and computes jhash.
+ * calls ht_store() to store data in hash table
+ * calls store_rb() to store data in rb tree.
+ *
  */
 
 static DEFINE_RAW_SPINLOCK(kernel_lock);
@@ -337,8 +316,9 @@ static int handle_stack(int pid, int mode, unsigned long long time)
 	//kernel task	
 	if(mode == 0) {
 		raw_spin_lock_irqsave(&kernel_lock, flags);
-		stack = kmalloc(1024, GFP_ATOMIC);
-		len = stack_trace_save(stack, 6, 0);
+		stack = kmalloc(BUFF_SIZE, GFP_ATOMIC);
+
+		len = stack_trace_save(stack, STACK_ENTRIES, 0);
 		if(len==0){
 			raw_spin_unlock_irqrestore(&kernel_lock, flags);
 			return 0;
@@ -356,8 +336,8 @@ static int handle_stack(int pid, int mode, unsigned long long time)
 			user_addr =(stack_trace_save_user_t) addr("stack_trace_save_user");
 			if(user_addr){
 				raw_spin_lock_irqsave(&user_lock, flags2);
-				stack = kmalloc(1024, GFP_ATOMIC);
-				len = user_addr(stack, 6);
+				stack = kmalloc(BUFF_SIZE, GFP_ATOMIC);
+				len = user_addr(stack, STACK_ENTRIES);
 				if(len==0){
 					raw_spin_unlock_irqrestore(&user_lock, flags2);
 					return 0;
@@ -365,17 +345,12 @@ static int handle_stack(int pid, int mode, unsigned long long time)
 				key_len = sizeof(stack[0])*len;
 				hash = jhash((void*)stack, key_len, 0);
 				raw_spin_unlock_irqrestore(&user_lock, flags2);
-				
 			}
 		}
-
 	}
-
-
 	
 	prev_task_time = ht_store(hash, pid, stack, len, time);
-
-//	if(prev_task_time>0)	
+//	if(prev_task_time>0)
 //		rc = store_rb(time, stack, len, prev_task_time);
 	if(rc)
                printk(KERN_INFO "error storing rb entry! \n");
@@ -385,6 +360,61 @@ static int handle_stack(int pid, int mode, unsigned long long time)
 
 	return rc;
 }
+
+
+/*
+ * Hash table to act as cache to store entry time and pid
+ *
+ */
+
+static DEFINE_HASHTABLE(cache_tbl, BITS);
+static DEFINE_RAW_SPINLOCK(cache_lock);
+
+struct cache_entry {
+        raw_spinlock_t lock;
+        int pid;
+        unsigned long long entry_time;
+        struct hlist_node hashlist;
+};
+
+static int cache_store(int key, unsigned long long time)
+{
+        unsigned long flags;
+
+        struct cache_entry *my_entry = kmalloc(sizeof(*my_entry), GFP_ATOMIC);
+        if(!my_entry || my_entry ==NULL)
+                return -ENOMEM;
+
+        raw_spin_lock_init(&my_entry->lock);
+        raw_spin_lock_irqsave(&cache_lock, flags);
+
+        my_entry->pid = key;
+        my_entry->entry_time = time;
+        hash_add(cache_tbl, &my_entry->hashlist, key);
+
+        raw_spin_unlock_irqrestore(&cache_lock, flags);
+
+        return 0;
+}
+
+static void cache_destroy(void)
+{
+        struct cache_entry *curr_entry;
+        int bkt;
+        struct hlist_node *next;
+        printk(KERN_INFO "Deleting cache table!");
+        hash_for_each_safe(cache_tbl, bkt, next, curr_entry, hashlist){
+                hash_del(&curr_entry->hashlist);
+                kfree(curr_entry);
+        }
+
+}
+
+/*
+ * Entry and return handler of kretprobe
+ *
+ */
+
 
 static DEFINE_RAW_SPINLOCK(entry_lock);
 
@@ -503,9 +533,11 @@ static int perftop_show(struct seq_file *m, void *v)
         hash_for_each(tbl, bkt, curr_entry, hashlist){
 		seq_printf(m, "\npid: %d and count: %d\n", curr_entry->pid, curr_entry->data);
 		seq_printf(m, "stack trace: \n");
-		for(itr = 0; itr<4; itr++)
+		for(itr = 0; itr<STACK_ENTRIES; itr++){
 			if(curr_entry->buff[itr])
                 		seq_printf(m, "0x%lx\n", curr_entry->buff[itr]);
+		}
+		seq_printf(m, "Function name: %s\n", curr_entry->function_name);
 		seq_printf(m, "time spent by task: %llu \n\n\n", curr_entry->curr_task_time);
 	}
 
