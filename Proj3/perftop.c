@@ -16,7 +16,7 @@
 
 #define BUFF_SIZE 1024
 #define STACK_ENTRIES 4
-
+#define BITS 10
 
 /* Module information */
 MODULE_LICENSE("GPL");
@@ -27,12 +27,10 @@ typedef unsigned long (*kallsyms_lookup_name_t)(const char *name);
 typedef unsigned int (*stack_trace_save_user_t)(unsigned long *store, unsigned int size);
 
 static kallsyms_lookup_name_t addr=NULL;
-static DEFINE_RAW_SPINLOCK(main_lock);
-
 
 
 /*
- * set up kprobe information 
+ * set up kprobe information
  */
 #define MAX_SYMBOL_LEN 64
 static char symbol[MAX_SYMBOL_LEN] = "kallsyms_lookup_name";
@@ -43,7 +41,7 @@ module_param_string(symbol2, symbol2, sizeof(symbol2), 0644);
 
 
 /*
- * kallsyms 
+ * register kprobe for kallsyms
  *
  */
 
@@ -60,65 +58,73 @@ static struct kprobe kp = {
 
 static kallsyms_lookup_name_t get_kallsyms_ptr(void)
 {
-	int ret;
-	kallsyms_lookup_name_t addr;
+        int ret;
+        kallsyms_lookup_name_t addr;
 
-	ret = register_kprobe(&kp);
+        ret = register_kprobe(&kp);
         if(ret < 0) {
                 printk(KERN_INFO "register kprobe failed, returned %d\n", ret);
                 return NULL;
         }
 
-	addr = (kallsyms_lookup_name_t) kp.addr;
+        addr = (kallsyms_lookup_name_t) kp.addr;
         printk(KERN_INFO "planted first kprobe at %p\n", addr);
-	return addr;
+        return addr;
 }
 
-/* 
+/*
  *
- * Red black tree Implementation
+ * Red black tree implementation
  *
  */
 
 static DEFINE_RAW_SPINLOCK(rb_lock);
 
 struct rb_struct {
-	unsigned long long time;
-	unsigned long buff[BUFF_SIZE];
-	struct rb_node node;
+        unsigned long long time;
+        unsigned long buff[BUFF_SIZE];
+	int pid;
+	u32 hash;
+	char func_name[BUFF_SIZE];
+        struct rb_node node;
 };
 
-struct rb_root rbtree = RB_ROOT;
+static struct rb_root rbtree = RB_ROOT;
+
 
 static int cmp(unsigned long long time, struct rb_struct* b)
 {
-	int rc = 0;
-	if(time > b->time)
-		rc = 1;
-	else if(time < b->time)
-		rc = -1;
-	
-	return rc; 
+        int rc = 0;
+        if(time > b->time)
+                rc = 1;
+        else if(time < b->time)
+                rc = -1;
+
+        return rc;
 }
 
 static void del_node(struct rb_node* curr)
 {
-	struct rb_struct *my_entry;
-	my_entry = rb_entry(curr, struct rb_struct, node);
-	rb_erase(&my_entry->node, &rbtree);
-	kfree(my_entry);
-	printk(KERN_INFO "Deleted!\n");
-
+	unsigned long flags;
+        struct rb_struct *my_entry;
+        my_entry = rb_entry(curr, struct rb_struct, node);
+	raw_spin_lock_irqsave(&rb_lock, flags);
+        if(my_entry){
+                rb_erase(&my_entry->node, &rbtree);
+                kfree(my_entry);
+                printk(KERN_INFO "Deleted!\n");
+        }
+	raw_spin_unlock_irqrestore(&rb_lock, flags);
 }
 
 static void find_node(unsigned long long prev_task_time)
 {
-	int c;
+        int c;
         struct rb_node **link = &rbtree.rb_node;
         struct rb_node *parent = NULL;
 
         struct rb_struct *curr;
-  
+
         while (*link) {
                 parent = *link;
                 curr = rb_entry(parent, struct rb_struct, node);
@@ -129,147 +135,147 @@ static void find_node(unsigned long long prev_task_time)
                 else if(c>0)
                         link = &parent->rb_right;
                 else {
-			printk(KERN_INFO "Found and handled!\n");
+                        printk(KERN_INFO "Found and handled!\n");
                         del_node(parent);
                         break;
                 }
         }
+
 }
 
-static int store_rb(unsigned long long time, unsigned long* buff, int len, unsigned long long prev_task_time)
+
+static int store_rb(unsigned long long time, unsigned long* buff, int pid, u32 hash, int len, unsigned long long prev_task_time)
 {
-	unsigned long flags;
-	int itr;
-	struct rb_node **link;
-	struct rb_node *parent;
-	struct rb_struct *curr;
-	struct rb_struct *my_entry;
+        unsigned long flags;
+        int itr;
+        struct rb_node **link;
+        struct rb_node *parent;
+        struct rb_struct *curr;
+        struct rb_struct *my_entry;
 
-	printk(KERN_INFO "\n\n\n Hi!\n");
-
+	/* find node with old time, delete it */
 	find_node(prev_task_time);
 
-	raw_spin_lock_irqsave(&rb_lock, flags);
-	link = &rbtree.rb_node;
-	parent = NULL;
-	my_entry = kmalloc(sizeof(my_entry), GFP_ATOMIC);
-        if(!my_entry || my_entry == NULL){
-		raw_spin_unlock_irqrestore(&rb_lock, flags);
+        my_entry = kmalloc(sizeof(*my_entry), GFP_ATOMIC);
+        if(!my_entry || my_entry == NULL)
                 return -ENOMEM;
-	}
+        
+
+	raw_spin_lock_irqsave(&rb_lock, flags);
+
+        link = &rbtree.rb_node;
+        parent = NULL;
+
+        my_entry->time = time;
+	my_entry->pid = pid;
+	my_entry->hash = hash;
+        for(itr=0; itr<len; itr++){
+               my_entry->buff[itr] = buff[itr];
+	       sprint_symbol(&my_entry->func_name[itr], buff[itr]);
+        }
+
+        while(*link) {
+                parent = *link;
+                curr = rb_entry(parent, struct rb_struct, node);
+                if(my_entry->time < curr->time)
+                        link = &parent->rb_left;
+                else
+                        link = &parent->rb_right;
+        }
 	
-	my_entry->time = time;
-	for(itr=0; itr<len; itr++)
-                my_entry->buff[itr] = buff[itr];
-
-
-	while(*link) {
-		parent = *link;
-		curr = rb_entry(parent, struct rb_struct, node);
-		if(my_entry->time < curr->time)
-			link = &parent->rb_left;
-		else
-			link = &parent->rb_right;
-	}
-
-	printk(KERN_INFO "buffer data: 0x%lu\n", my_entry->buff[0]);
 	rb_link_node(&my_entry->node, parent, link);
-
-	printk(KERN_INFO "Inserted?\n");
 	rb_insert_color(&my_entry->node, &rbtree);
-	printk(KERN_INFO "Colored? \n");
 
 	raw_spin_unlock_irqrestore(&rb_lock, flags);
 
-	return 0;
+        return 0;
 }
 
 
 static void destroy_rb(void)
 {
-	struct rb_node *curr;
-	struct rb_struct *my_entry;
+	unsigned long flags;
+        struct rb_node *curr;
+        struct rb_struct *my_entry;
 
-	printk(KERN_INFO "Deleting rb tree!\n");
-
-	for(curr = rb_first(&rbtree); curr; curr = rb_next(curr)) {
-		my_entry = rb_entry(curr, struct rb_struct, node);
-		rb_erase(&my_entry->node, &rbtree);
-		kfree(my_entry);
-	}
+        printk(KERN_INFO "Deleting rb tree!\n");
+	raw_spin_lock_irqsave(&rb_lock, flags);
+        for(curr = rb_first(&rbtree); curr; curr = rb_next(curr)) {
+                my_entry = rb_entry(curr, struct rb_struct, node);
+                rb_erase(&my_entry->node, &rbtree);
+                kfree(my_entry);
+        }
+	raw_spin_unlock_irqrestore(&rb_lock, flags);
 }
+
 
 /*
  *
- * Hash Table Implementation
+ * Hash Table implementation
  *
  */
 
-#define BITS 10
-
 static DEFINE_RAW_SPINLOCK(hash_lock);
-
 static DEFINE_HASHTABLE(tbl, BITS);
 
 struct ht_entry {
 	raw_spinlock_t lock;
-        int data;
+	int data;
 	int pid;
 	unsigned long buff[BUFF_SIZE];
-	char function_name[BUFF_SIZE];
 	unsigned long long curr_task_time;
 	unsigned long long prev_task_time;
-        struct hlist_node hashlist;
+	struct hlist_node hashlist;
 };
 
-
-static unsigned long long ht_store(u32 key,int pid, unsigned long* buff,int len, unsigned long long time)
+static unsigned long long store_ht(u32 key, int pid, unsigned long* buff, int len, unsigned long long time)
 {
+	unsigned long long prev_task_time = 12;
 	struct ht_entry *curr;
 	unsigned long flags;
-	int val;
-	int itr;
-	unsigned long long prev_task_time;
+	int val, itr;
 	struct ht_entry *my_entry = kmalloc(sizeof(*my_entry), GFP_ATOMIC);
 
 	if(!my_entry || !my_entry->buff)
-                return -ENOMEM;
-	
+		return -ENOMEM;
+
 	raw_spin_lock_init(&my_entry->lock);
 
 	/*
-	 * check for key, if it exists remove the entry and create new entry with incremented value
-	 * cannot find any other way to do this
-	 *
-	 */
+         * check for key, if it exists remove the entry and create new entry with incremented value
+         * cannot find any other way to do this
+         *
+         */
 
-	raw_spin_lock_irqsave(&hash_lock, flags);
+        raw_spin_lock_irqsave(&hash_lock, flags);
 
 	//delete previous entry from hash table
-	hash_for_each_possible(tbl, curr, hashlist, key) {
-		val = curr->data;
-		hash_del(&curr->hashlist);
-		kfree(curr);
+        hash_for_each_possible(tbl, curr, hashlist, key) {
+                val = curr->data;
+                hash_del(&curr->hashlist);
+                kfree(curr);
+        }
+	if(val<1) {
+		kfree(my_entry);
+		raw_spin_unlock_irqrestore(&hash_lock, flags);
+		return -1;
 	}
 
-	for(itr=0; itr<len; itr++){
-		my_entry->buff[itr] = buff[itr];
+        for(itr=0; itr<len; itr++){
+                my_entry->buff[itr] = buff[itr];
+       }
+	
+        my_entry->data = val + 1;
+        my_entry->pid = pid;
+        my_entry->prev_task_time = my_entry->curr_task_time;
+        prev_task_time = my_entry->prev_task_time;
+        my_entry->curr_task_time = time;
 
-		//store function name of address
-		sprint_symbol(&my_entry->function_name[itr], buff[itr]); 
-	}
 
-	my_entry->data = val + 1;
-	my_entry->pid = pid;
-	my_entry->prev_task_time = my_entry->curr_task_time;
-	prev_task_time = my_entry->prev_task_time;
-	my_entry->curr_task_time = time;
-	
-	
-	//add current task to hash table
-	hash_add(tbl, &my_entry->hashlist, key);
-	
-	raw_spin_unlock_irqrestore(&hash_lock, flags);
+        //add current task to hash table
+        hash_add(tbl, &my_entry->hashlist, key);
+
+        raw_spin_unlock_irqrestore(&hash_lock, flags);
 
 	return prev_task_time;
 }
@@ -277,15 +283,18 @@ static unsigned long long ht_store(u32 key,int pid, unsigned long* buff,int len,
 
 static void destroy_ht(void)
 {
-	struct ht_entry *curr_entry;
-	int bkt;
- 	struct hlist_node *next;
-	printk(KERN_INFO "Deleting hash table!");
-	hash_for_each_safe(tbl, bkt, next, curr_entry, hashlist){
-		hash_del(&curr_entry->hashlist);
-		kfree(curr_entry);
-	}
+	unsigned long flags;
+        struct ht_entry *curr_entry;
+        int bkt;
+        struct hlist_node *next;
+        printk(KERN_INFO "Deleting hash table!");
 
+	raw_spin_lock_irqsave(&hash_lock, flags);
+        hash_for_each_safe(tbl, bkt, next, curr_entry, hashlist){
+                hash_del(&curr_entry->hashlist);
+                kfree(curr_entry);
+        }
+	raw_spin_unlock_irqrestore(&hash_lock, flags);
 }
 
 
@@ -298,69 +307,57 @@ static void destroy_ht(void)
  *
  */
 
-static DEFINE_RAW_SPINLOCK(kernel_lock);
-static DEFINE_RAW_SPINLOCK(user_lock);
+static DEFINE_RAW_SPINLOCK(handle_lock);
 
 static int handle_stack(int pid, int mode, unsigned long long time)
 {
-	int rc = 0;
-	int len = 0;
+	int rc = 0, len = 0;
 	stack_trace_save_user_t user_addr;
 	u32 hash;
 	unsigned int key_len;
-	unsigned long flags, flags2;
+	unsigned long flags;
 	unsigned long *stack;
 	unsigned long long prev_task_time;
 
+	raw_spin_lock_irqsave(&handle_lock, flags);
 
-	//kernel task	
-	if(mode == 0) {
-		raw_spin_lock_irqsave(&kernel_lock, flags);
-		stack = kmalloc(BUFF_SIZE, GFP_ATOMIC);
+        stack = kmalloc(BUFF_SIZE, GFP_ATOMIC);
 
-		len = stack_trace_save(stack, STACK_ENTRIES, 0);
-		if(len==0){
-			raw_spin_unlock_irqrestore(&kernel_lock, flags);
-			return 0;
-		}
-		key_len = sizeof(stack[0])*len;
-		hash = jhash((void*)stack, key_len, 0);
-		raw_spin_unlock_irqrestore(&kernel_lock, flags);
-		
+        //kernel mode
+        if(mode==0)
+                len = stack_trace_save(stack, STACK_ENTRIES, 0);
+        //user mode
+        else {
+                if(addr) {
+                        user_addr =(stack_trace_save_user_t) addr("stack_trace_save_user");
+                        if(user_addr)
+                                len = user_addr(stack, STACK_ENTRIES);
+                }
+        }
+        if(len==0){
+                kfree(stack);
+                raw_spin_unlock_irqrestore(&handle_lock, flags);
+                return 0;
+        }
 
-	}
+        //compute jhash
+        key_len = sizeof(stack[0])*len;
+        hash = jhash((void*)stack, key_len, 0);
 
-	//user task
-	else {
-		if(addr) {
-			user_addr =(stack_trace_save_user_t) addr("stack_trace_save_user");
-			if(user_addr){
-				raw_spin_lock_irqsave(&user_lock, flags2);
-				stack = kmalloc(BUFF_SIZE, GFP_ATOMIC);
-				len = user_addr(stack, STACK_ENTRIES);
-				if(len==0){
-					raw_spin_unlock_irqrestore(&user_lock, flags2);
-					return 0;
-				}
-				key_len = sizeof(stack[0])*len;
-				hash = jhash((void*)stack, key_len, 0);
-				raw_spin_unlock_irqrestore(&user_lock, flags2);
-			}
-		}
-	}
+        //store in hash table
+	prev_task_time = store_ht(hash, pid, stack, len, time);
+
+        //store in rb-tree
+        if(prev_task_time>0)
+		rc = store_rb(time, stack, pid, hash, len, prev_task_time);
+        if(rc)
+                printk(KERN_INFO "error storing rb entry! \n");
+
+        kfree(stack);
+        raw_spin_unlock_irqrestore(&handle_lock, flags);
 	
-	prev_task_time = ht_store(hash, pid, stack, len, time);
-//	if(prev_task_time>0)
-//		rc = store_rb(time, stack, len, prev_task_time);
-	if(rc)
-               printk(KERN_INFO "error storing rb entry! \n");
-	
-	
-	kfree(stack);
-
 	return rc;
 }
-
 
 /*
  * Hash table to act as cache to store entry time and pid
@@ -372,7 +369,7 @@ static DEFINE_RAW_SPINLOCK(cache_lock);
 
 struct cache_entry {
         raw_spinlock_t lock;
-        int pid;
+        int pid; 
         unsigned long long entry_time;
         struct hlist_node hashlist;
 };
@@ -380,7 +377,7 @@ struct cache_entry {
 static int cache_store(int key, unsigned long long time)
 {
         unsigned long flags;
-
+	
         struct cache_entry *my_entry = kmalloc(sizeof(*my_entry), GFP_ATOMIC);
         if(!my_entry || my_entry ==NULL)
                 return -ENOMEM;
@@ -407,92 +404,137 @@ static void cache_destroy(void)
                 hash_del(&curr_entry->hashlist);
                 kfree(curr_entry);
         }
-
 }
 
+
 /*
- * Entry and return handler of kretprobe
+ * kretprobe entry and return handlers
  *
  */
-
 
 static DEFINE_RAW_SPINLOCK(entry_lock);
 
 static int entry_handler(struct kretprobe_instance *ri, struct pt_regs *regs)
 {
-	int rc = 0;
-	int pid;
+        int rc = 0;
+        int pid;
         unsigned long long start_time;
-	unsigned long flags;
-	
-	raw_spin_lock_irqsave(&entry_lock, flags);
-	pid = current ->pid;
-	start_time = rdtsc();
-	raw_spin_unlock_irqrestore(&entry_lock, flags);
-	
-	rc = cache_store(pid, start_time);
-	if(rc)
-		printk(KERN_INFO "error in cache!\n");
+        unsigned long flags;
 
-	return 0;
+        raw_spin_lock_irqsave(&entry_lock, flags);
+        pid = current->pid;
+        start_time = rdtsc();
+        raw_spin_unlock_irqrestore(&entry_lock, flags);
+
+        rc = cache_store(pid, start_time);
+        if(rc)
+                printk(KERN_INFO "error in cache!\n");
+
+        return 0;
 }
 
 
-static int ret_handler(struct kretprobe_instance *ri, struct pt_regs *regs) 
+static int ret_handler(struct kretprobe_instance *ri, struct pt_regs *regs)
 {
-	
 	int rc = 0;
-	unsigned long flags, retval;
-	unsigned long long start_time, time;
+	unsigned long retval;
+	unsigned long long start_time, total_time;
 	int pid;
-	struct mm_struct *mm;
-	struct task_struct *task;
 	struct cache_entry *curr;
+	struct task_struct *task;
+	struct mm_struct *mm;
 
-	
+
 	retval = regs_return_value(regs);
-	
 	if(retval) {
-		raw_spin_lock_irqsave(&main_lock, flags);
 
-        	task = (struct task_struct *)(retval);
+		task = (struct task_struct *)retval;
 		task = list_entry(task->tasks.prev, struct task_struct, tasks);
-		
-       		pid = task->pid;
 
+		pid = task->pid;
 
-		// fetch start time from cached entry 
-		hash_for_each_possible(cache_tbl, curr, hashlist, pid) 
+		hash_for_each_possible(cache_tbl, curr, hashlist, pid)
 			start_time = curr->entry_time;
-
-		time = rdtsc() - start_time;
-		mm = (struct mm_struct *) task->mm; 
-
-		raw_spin_unlock_irqrestore(&main_lock, flags);
+			
+		total_time = rdtsc() - start_time;
+		mm = (struct mm_struct *)task->mm;
 
 		if(pid!=0){
-			if(mm == NULL)	//check if mm ptr is NULL.
-				rc = handle_stack(pid, 0, time); //kernel space
+			if(mm==NULL)
+				rc = handle_stack(pid, 0, total_time);
 			else
-				rc = handle_stack(pid, 1, time); //user space
-
-       			if(rc)
-				printk(KERN_INFO "error in handle_stack function!\n");		
+				rc = handle_stack(pid, 1, total_time);
+			if(rc)
+				printk(KERN_INFO "error in handle_stack function!\n");
 		}
-		
-
 	}
 
-	return 0;
+	return rc;
 }
 
-static struct kretprobe my_kretprobe = {
-	.handler = ret_handler,
-	.kp.symbol_name = symbol2,
-	.entry_handler = entry_handler
+
+
+/*
+ * proc node implementation
+ */
+
+static int perftop_show(struct seq_file *m, void *v);
+static int perftop_open(struct inode *inode, struct file *file);
+
+static const struct proc_ops perftop_ops = {
+        .proc_open = perftop_open,
+        .proc_read = seq_read,
+        .proc_lseek = seq_lseek,
+        .proc_release = single_release
 };
 
-static int set_probe_2(void)
+static int perftop_show(struct seq_file *m, void *v)
+{
+	struct rb_node *curr;
+        struct rb_struct *my_entry;
+        int i = 1, itr;
+
+	/* print rb tree entries */
+        for(curr = rb_last(&rbtree); curr && i<=20; curr = rb_prev(curr)) {
+                my_entry = rb_entry(curr, struct rb_struct, node);
+                seq_printf(m, "COUNT: %d\n", i);
+		seq_printf(m, "Pid: %d and JHash: %d\n", my_entry->pid, my_entry->hash);
+                seq_printf(m, "stack trace: \n");
+                for(itr = 0; itr<STACK_ENTRIES; itr++)
+			if(my_entry->buff[itr])
+				seq_printf(m, "0x%lx\n", my_entry->buff[itr]);
+
+		seq_printf(m, "function names: \n");
+		for(itr = 0; itr<STACK_ENTRIES; itr++)
+                        if(my_entry->func_name[itr])
+                                seq_printf(m, "%s\n", my_entry->func_name);
+                seq_printf(m, "time spent by task: %llu \n\n", my_entry->time);
+                ++i;
+        }
+
+        return 0;
+}
+
+static int perftop_open(struct inode *inode, struct file *file)
+{
+        return single_open(file, perftop_show, NULL);
+}
+
+
+
+/*
+ *
+ * Register kretprobe for pick_next_task_fair
+ *
+ */
+
+static struct kretprobe my_kretprobe = {
+        .handler = ret_handler,
+        .kp.symbol_name = symbol2,
+        .entry_handler = entry_handler
+};
+
+static int set_kretprobe(void)
 {
         int ret = 0;
         ret = register_kretprobe(&my_kretprobe);
@@ -507,114 +549,55 @@ static int set_probe_2(void)
 
 
 /*
- * proc node implementation
- */
-
-static int perftop_show(struct seq_file *m, void *v);
-static int perftop_open(struct inode *inode, struct file *file);
-
-static const struct proc_ops perftop_ops = {
-	.proc_open = perftop_open,
-	.proc_read = seq_read,
-	.proc_lseek = seq_lseek,
-	.proc_release = single_release
-};
-
-static int perftop_show(struct seq_file *m, void *v)
-{	
-	int bkt;
-	struct ht_entry *curr_entry;
-	//struct rb_node *curr;
-	//struct rb_struct *my_entry;
-	//int i = 0;
-	int itr = 0;
-
-	/* print hash table entries */
-        hash_for_each(tbl, bkt, curr_entry, hashlist){
-		seq_printf(m, "\npid: %d and count: %d\n", curr_entry->pid, curr_entry->data);
-		seq_printf(m, "stack trace: \n");
-		for(itr = 0; itr<STACK_ENTRIES; itr++){
-			if(curr_entry->buff[itr])
-                		seq_printf(m, "0x%lx\n", curr_entry->buff[itr]);
-		}
-		seq_printf(m, "Function name: %s\n", curr_entry->function_name);
-		seq_printf(m, "time spent by task: %llu \n\n\n", curr_entry->curr_task_time);
-	}
-
-
-	/* print rb tree entries */
-/*	for(curr = rb_first(&rbtree); curr && i<20; curr = rb_next(curr)) {
-		my_entry = rb_entry(curr, struct rb_struct, node);
-		seq_printf(m, "COUNT: %d\n\n", i);
-		seq_printf(m, "stack trace: \n");
-                for(itr2 = 0; itr2<4; itr2++)
-                        if(my_entry->buff[itr2])
-                                seq_printf(m, "0x%lx\n", my_entry->buff[itr2]);
-                seq_printf(m, "time spent by task: %llu \n\n\n", my_entry->time);
-
-	//	seq_printf(m, "stack trace: %s\n", (char*)my_entry->buff);
-	//	seq_printf(m, "time spent by task: %llu \n\n\n", my_entry->time);
-		++i;
-	}
-*/
-	return 0;
-}
-
-static int perftop_open(struct inode *inode, struct file *file)
-{
-	return single_open(file, perftop_show, NULL);
-}
-
-
-/*
  * init and exit functions of module
  */
 static int __init perftop_init(void)
 {
-	int ret = 0;
-	/* create proc node */
-	proc_create("perftop", 0, NULL, &perftop_ops);
-	printk(KERN_INFO "/proc/perftop created!\n");
+        int ret = 0;
+        /* create proc node */
+        proc_create("perftop", 0, NULL, &perftop_ops);
+        printk(KERN_INFO "/proc/perftop created!\n");
 
-	/* call kallsyms lookup ptr function */
-	addr = get_kallsyms_ptr();
-	
+        /* call kallsyms lookup ptr function */
+        addr = get_kallsyms_ptr();
 
-	/* register kretprobe */
-	ret = set_probe_2();
 
-	return 0;
+        /* register kretprobe */
+        ret = set_kretprobe();
+
+        return 0;
 }
 
 static void cleanup(void)
 {
-	/* unregistering the kprobes */
-	unregister_kprobe(&kp);
+        /* unregistering the kprobes */
+        unregister_kprobe(&kp);
         printk(KERN_INFO "first kprobe at %p unregistered\n", kp.addr);
 
         unregister_kretprobe(&my_kretprobe);
         printk(KERN_INFO "second kprobe at %p unregistered\n", my_kretprobe.kp.addr);
 
-	/*cleaning cache table */
-	cache_destroy();
+        /*cleaning cache table */
+        cache_destroy();
 
-	/* cleaning hash table */
+        /* cleaning hash table */
         destroy_ht();
 
-	/* cleaning rb tree*/
-	destroy_rb();
+        /* cleaning rb tree*/
+        destroy_rb();
 
-	/* removing proc node */
+        /* removing proc node */
         remove_proc_entry("perftop", NULL);
         printk(KERN_INFO "/proc/perftop removed!\n");
-	return;
+        return;
 }
 
 static void __exit perftop_exit(void)
 {
-	cleanup();
-	return;
+        cleanup();
+        return;
 }
 
 module_init(perftop_init);
 module_exit(perftop_exit);
+
